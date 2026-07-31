@@ -96,7 +96,53 @@ app.get('/api/get-ward-status/:ward', async (req, res) => {
     res.json(statusMap);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// डैशबोर्ड के लाइव आंकड़े लाने के लिए
+app.get('/api/admin/dashboard-stats', async (req, res) => {
+  try {
+    // 1. कुल यूज़र्स (Operators) की संख्या
+    const totalUsers = await User.count({ where: { role: 'user' } });
 
+    // 2. पूर्ण वार्ड (जिनके सभी 9 अनुभाग 'complete' हैं)
+    // इसके लिए हम WardData में ग्रुपिंग करेंगे
+    const completeWardsData = await WardData.findAll({
+      where: { status: 'complete' },
+      attributes: ['ward_no', [sequelize.fn('COUNT', sequelize.col('section_no')), 'completed_sections']],
+      group: ['ward_no'],
+      having: sequelize.where(sequelize.fn('COUNT', sequelize.col('section_no')), '=', 9)
+    });
+
+    const completeCount = completeWardsData.length;
+    const totalWards = 49;
+    const pendingCount = totalWards - completeCount;
+
+    res.json({
+      totalWards,
+      totalUsers,
+      completeCount,
+      pendingCount
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// सभी वार्डों का समरी डेटा लाने के लिए
+app.get('/api/admin/all-wards-summary', async (req, res) => {
+  try {
+    const allData = await WardData.findAll();
+    // डेटा को वार्ड के हिसाब से ग्रुप करें
+    const summary = {};
+    allData.forEach(item => {
+      if (!summary[item.ward_no]) summary[item.ward_no] = {};
+      summary[item.ward_no][item.section_no] = {
+        status: item.status,
+        data: item.data
+      };
+    });
+    res.json(summary);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // --- 4. Start Server ---
 const PORT = process.env.PORT || 5000;
 sequelize.sync({ alter: true }).then(async () => {
