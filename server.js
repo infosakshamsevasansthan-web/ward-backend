@@ -6,12 +6,13 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
 
+// 1. Middleware
+app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// 1. Database Connection
+// 2. Database Connection
 const sequelize = new Sequelize(process.env.DATABASE_URL, {
   dialect: 'postgres',
   logging: false,
@@ -20,7 +21,7 @@ const sequelize = new Sequelize(process.env.DATABASE_URL, {
   }
 });
 
-// 2. Models
+// 3. Models
 const User = sequelize.define('User', {
   username: { type: DataTypes.STRING, unique: true, allowNull: false },
   password: { type: DataTypes.STRING, allowNull: false },
@@ -37,23 +38,29 @@ const WardData = sequelize.define('WardData', {
   indexes: [{ unique: true, fields: ['ward_no', 'section_no'] }]
 });
 
-// --- 3. API Routes ---
+// --- 4. API Routes ---
 
-// लॉगिन
+// लॉगिन API
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   try {
     const user = await User.findOne({ where: { username } });
     if (!user) return res.status(404).json({ message: "उपयोगकर्ता नहीं मिला!" });
+    
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: "पासवर्ड गलत है!" });
 
     const token = jwt.sign({ id: user.id, role: user.role }, 'SECRET_KEY_123', { expiresIn: '1d' });
-    res.json({ token, role: user.role, username: user.username, assigned_wards: user.assigned_wards });
+    res.json({ 
+      token, 
+      role: user.role, 
+      username: user.username, 
+      assigned_wards: user.assigned_wards 
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// यूजर मैनेजमेंट (Admin Only)
+// यूजर मैनेजमेंट (सिर्फ Admin के लिए)
 app.get('/api/users', async (req, res) => {
   try {
     const users = await User.findAll({ where: { role: 'user' }, attributes: { exclude: ['password'] } });
@@ -70,16 +77,33 @@ app.post('/api/users', async (req, res) => {
   } catch (err) { res.status(500).json({ error: "यूजरनाम पहले से मौजूद है!" }); }
 });
 
-// डेटा सेव/अपडेट
+// डेटा सेव/अपडेट (Individual Sections)
+// डेटा सेव/अपडेट करने का एकदम पक्का तरीका
 app.post('/api/save-ward-data', async (req, res) => {
   const { ward_no, section_no, data, status } = req.body;
+  
   try {
-    await WardData.upsert({ ward_no, section_no, data, status });
-    res.json({ message: "डेटा सुरक्षित हुआ!", status });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    // 1. पहले चेक करो कि क्या इस वार्ड और सेक्शन का डेटा पहले से है?
+    const existingRecord = await WardData.findOne({ 
+      where: { ward_no, section_no } 
+    });
+
+    if (existingRecord) {
+      // 2. अगर है, तो उसे अपडेट (Update) कर दो
+      await existingRecord.update({ data, status });
+      return res.json({ message: "डेटा अपडेट हो गया!", status });
+    } else {
+      // 3. अगर नहीं है, तो नया बना (Create) दो
+      await WardData.create({ ward_no, section_no, data, status });
+      return res.json({ message: "डेटा सुरक्षित हो गया!", status });
+    }
+  } catch (err) {
+    console.error("SAVE ERROR:", err); // यह टर्मिनल में असली एरर दिखाएगा
+    res.status(500).json({ error: "डेटाबेस एरर: " + err.message });
+  }
 });
 
-// डेटा वापस लाना (Pre-fill)
+// डेटा वापस लोड करना (Pre-fill Form)
 app.get('/api/get-ward-data/:ward/:section', async (req, res) => {
   try {
     const record = await WardData.findOne({ where: { ward_no: req.params.ward, section_no: req.params.section } });
@@ -87,7 +111,7 @@ app.get('/api/get-ward-data/:ward/:section', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// पूरे वार्ड का स्टेटस
+// पूरे वार्ड के अनुभागों का स्टेटस
 app.get('/api/get-ward-status/:ward', async (req, res) => {
   try {
     const results = await WardData.findAll({ where: { ward_no: req.params.ward }, attributes: ['section_no', 'status'] });
@@ -96,60 +120,68 @@ app.get('/api/get-ward-status/:ward', async (req, res) => {
     res.json(statusMap);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// डैशबोर्ड के लाइव आंकड़े लाने के लिए
+
+// डैशबोर्ड लाइव स्टैट्स
 app.get('/api/admin/dashboard-stats', async (req, res) => {
   try {
-    // 1. कुल यूज़र्स (Operators) की संख्या
     const totalUsers = await User.count({ where: { role: 'user' } });
-
-    // 2. पूर्ण वार्ड (जिनके सभी 9 अनुभाग 'complete' हैं)
-    // इसके लिए हम WardData में ग्रुपिंग करेंगे
     const completeWardsData = await WardData.findAll({
       where: { status: 'complete' },
-      attributes: ['ward_no', [sequelize.fn('COUNT', sequelize.col('section_no')), 'completed_sections']],
+      attributes: ['ward_no'],
       group: ['ward_no'],
       having: sequelize.where(sequelize.fn('COUNT', sequelize.col('section_no')), '=', 9)
     });
-
     const completeCount = completeWardsData.length;
-    const totalWards = 49;
-    const pendingCount = totalWards - completeCount;
-
-    res.json({
-      totalWards,
-      totalUsers,
-      completeCount,
-      pendingCount
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ totalWards: 49, totalUsers, completeCount, pendingCount: 49 - completeCount });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// सभी वार्डों का समरी डेटा लाने के लिए
+
+// सभी वार्डों की समरी (Dashboard Table)
 app.get('/api/admin/all-wards-summary', async (req, res) => {
   try {
     const allData = await WardData.findAll();
-    // डेटा को वार्ड के हिसाब से ग्रुप करें
     const summary = {};
     allData.forEach(item => {
       if (!summary[item.ward_no]) summary[item.ward_no] = {};
-      summary[item.ward_no][item.section_no] = {
-        status: item.status,
-        data: item.data
-      };
+      summary[item.ward_no][item.section_no] = { status: item.status, data: item.data };
     });
     res.json(summary);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/ward-full-report/:ward', async (req, res) => {
+  try {
+    const data = await WardData.findAll({
+      where: { ward_no: req.params.ward },
+      order: [['section_no', 'ASC']]
+    });
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-// --- 4. Start Server ---
+app.post('/api/change-password', async (req, res) => {
+  const { username, oldPassword, newPassword } = req.body;
+  try {
+    const user = await User.findOne({ where: { username } });
+    const isMatch = await bcrypt.compare(oldPassword, user.password);
+    if (!isMatch) return res.status(401).json({ message: "पुराना पासवर्ड गलत है!" });
+
+    const hashedNew = await bcrypt.hash(newPassword, 10);
+    user.password = hashedNew;
+    await user.save();
+    res.json({ message: "Success" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// --- 5. Start Server ---
 const PORT = process.env.PORT || 5000;
 sequelize.sync({ alter: true }).then(async () => {
   const adminCount = await User.count({ where: { role: 'admin' } });
   if (adminCount === 0) {
     const hashedPassword = await bcrypt.hash('admin123', 10);
     await User.create({ username: 'admin', password: hashedPassword, role: 'admin', assigned_wards: [] });
+    console.log("--> Default Admin: admin / admin123");
   }
-  app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
-});
+  app.listen(PORT, () => console.log(`🚀 API Server running on port ${PORT}`));
+}).catch(err => console.error("❌ DB Error:", err));
